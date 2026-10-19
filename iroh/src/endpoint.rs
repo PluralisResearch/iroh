@@ -2093,7 +2093,8 @@ mod tests {
         address_lookup::memory::MemoryLookup,
         endpoint::{
             ApplicationClose, BindError, BindOpts, ConnectError, ConnectOptions,
-            ConnectWithOptsError, Connection, ConnectionError, PathEvent, PathEventStream, presets,
+            ConnectWithOptsError, Connection, ConnectionError, PathEvent, PathEventStream,
+            QuicTransportConfig, presets,
         },
         protocol::{AcceptError, ProtocolHandler, Router},
         test_utils::{
@@ -2485,6 +2486,54 @@ mod tests {
             ConnectionError::ApplicationClosed(ApplicationClose { .. })
         ));
 
+        Ok(())
+    }
+
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    #[traced_test]
+    async fn endpoint_two_direct_without_holepunching() -> Result {
+        let bind = || {
+            Endpoint::builder(presets::Minimal)
+                .alpns(vec![TEST_ALPN.to_vec()])
+                .relay_mode(RelayMode::Disabled)
+                .transport_config(
+                    QuicTransportConfig::builder()
+                        .max_remote_nat_traversal_addresses(0)
+                        .build(),
+                )
+                .bind()
+        };
+        let server = bind().await?;
+        let client = bind().await?;
+        let server_addr = server.addr();
+
+        let accept = tokio::spawn(async move {
+            let conn = server.accept().await.anyerr()?.await.anyerr()?;
+            let (mut send, mut recv) = conn.accept_bi().await.anyerr()?;
+            let msg = recv.read_to_end(100).await.anyerr()?;
+            send.write_all(&msg).await.anyerr()?;
+            send.finish().anyerr()?;
+            conn.closed().await;
+            Ok::<_, Error>(())
+        });
+
+        let conn = client.connect(server_addr, TEST_ALPN).await?;
+        let (mut send, mut recv) = conn.open_bi().await.anyerr()?;
+        send.write_all(b"hello").await.anyerr()?;
+        send.finish().anyerr()?;
+        assert_eq!(recv.read_to_end(100).await.anyerr()?, b"hello");
+
+        // Holepunching would start as the connection is registered.
+        let metrics = &client.metrics().socket;
+        while metrics.num_conns_opened.get() == 0 {
+            time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(metrics.holepunch_attempts.get(), 0);
+        assert_eq!(conn.paths().len(), 1);
+
+        conn.close(0u32.into(), b"done");
+        accept.await.anyerr()??;
         Ok(())
     }
 

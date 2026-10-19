@@ -534,9 +534,13 @@ impl QuicTransportConfigBuilder {
     /// enabled via [`Self::max_concurrent_multipath_paths`], a default value of
     /// 8 will be used.
     ///
-    /// Note: this method will ignore values less than the recommended 8 and will log a warning.
+    /// Setting this to 0 disables holepunching: the extension is not negotiated, so no address
+    /// candidates are exchanged and no paths are opened to them.
+    ///
+    /// Note: this method will ignore nonzero values less than the recommended 8 and will log a
+    /// warning.
     pub fn max_remote_nat_traversal_addresses(mut self, max_addresses: u8) -> Self {
-        if max_addresses < MAX_MULTIPATH_PATHS as u8 {
+        if max_addresses != 0 && max_addresses < MAX_MULTIPATH_PATHS as u8 {
             warn!(
                 "QuicTransportConfig::max_remote_nat_traversal_addresses must be at least {}, ignoring user supplied value",
                 MAX_MULTIPATH_PATHS
