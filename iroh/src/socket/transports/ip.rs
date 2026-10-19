@@ -3,8 +3,8 @@ use std::{
     net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6},
     num::NonZeroUsize,
     pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
+    sync::{Arc, Mutex},
+    task::{Context, Poll, Wake, Waker},
 };
 
 use ipnet::{Ipv4Net, Ipv6Net};
@@ -22,6 +22,7 @@ pub(crate) struct IpTransport {
     socket: Arc<UdpSocket>,
     local_addr: Watchable<SocketAddr>,
     metrics: Arc<SocketMetrics>,
+    send_waiters: Arc<SendWaiters>,
 }
 
 impl std::fmt::Display for IpTransport {
@@ -185,6 +186,7 @@ impl IpTransport {
             socket: Arc::new(socket),
             local_addr,
             metrics,
+            send_waiters: Default::default(),
         })
     }
 
@@ -263,7 +265,44 @@ impl IpTransport {
             config: self.config,
             sender,
             metrics: self.metrics.clone(),
+            send_waiters: self.send_waiters.clone(),
+            socket_waker: Waker::from(self.send_waiters.clone()),
         }
+    }
+}
+
+/// Senders waiting for their socket to accept more datagrams.
+///
+/// The socket keeps only the waker it was last polled with, so of several tasks sending on it only
+/// one would be woken. Senders poll it with a waker for this set instead, which wakes them all.
+/// A sender that gets a datagram through wakes them too: while the socket is being rebound, netwatch
+/// can drop the registered waker without waking it.
+#[derive(Debug, Default)]
+struct SendWaiters(Mutex<Vec<Waker>>);
+
+impl SendWaiters {
+    fn register(&self, waker: &Waker) {
+        let mut wakers = self.0.lock().expect("poisoned");
+        if !wakers.iter().any(|known| known.will_wake(waker)) {
+            wakers.push(waker.clone());
+        }
+    }
+
+    fn wake_all(&self) {
+        let wakers = std::mem::take(&mut *self.0.lock().expect("poisoned"));
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+}
+
+impl Wake for SendWaiters {
+    fn wake(self: Arc<Self>) {
+        self.wake_all();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.wake_all();
     }
 }
 
@@ -296,6 +335,8 @@ pub(super) struct IpSender {
     #[pin]
     sender: UdpSender,
     metrics: Arc<SocketMetrics>,
+    send_waiters: Arc<SendWaiters>,
+    socket_waker: Waker,
 }
 
 impl IpSender {
@@ -325,16 +366,24 @@ impl IpSender {
         transmit: &Transmit<'_>,
     ) -> Poll<io::Result<()>> {
         let total_bytes = transmit.contents.len() as u64;
-        let res = Pin::new(&mut self.sender).poll_send(
-            &noq_udp::Transmit {
-                destination: Self::canonical_addr(dst),
-                ecn: transmit.ecn,
-                contents: transmit.contents,
-                segment_size: transmit.segment_size,
-                src_ip: src,
-            },
-            cx,
-        );
+        let transmit = noq_udp::Transmit {
+            destination: Self::canonical_addr(dst),
+            ecn: transmit.ecn,
+            contents: transmit.contents,
+            segment_size: transmit.segment_size,
+            src_ip: src,
+        };
+        let this = &mut *self;
+        let mut socket_cx = Context::from_waker(&this.socket_waker);
+        let mut res = Pin::new(&mut this.sender).poll_send(&transmit, &mut socket_cx);
+        if res.is_pending() {
+            // The socket may have drained before this sender was registered, so try once more.
+            this.send_waiters.register(cx.waker());
+            res = Pin::new(&mut this.sender).poll_send(&transmit, &mut socket_cx);
+        }
+        if res.is_ready() {
+            this.send_waiters.wake_all();
+        }
 
         match res {
             Poll::Ready(Ok(res)) => {
@@ -479,6 +528,8 @@ impl IpTransports {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     #[tokio::test]
@@ -544,5 +595,38 @@ mod tests {
             assert_eq!(transports.default_v6_index, Some(2));
         }
         Ok(())
+    }
+
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn send_waiters_wake_every_waiting_sender_once() {
+        let waiters = Arc::new(SendWaiters::default());
+        let tasks: Vec<Arc<WakeCount>> = (0..2).map(|_| Default::default()).collect();
+        for task in &tasks {
+            let waker = Waker::from(task.clone());
+            waiters.register(&waker);
+            waiters.register(&waker);
+        }
+
+        let socket_waker = Waker::from(waiters.clone());
+        socket_waker.wake_by_ref();
+        socket_waker.wake_by_ref();
+        for task in &tasks {
+            assert_eq!(task.0.load(Ordering::Relaxed), 1);
+        }
+
+        waiters.register(&Waker::from(tasks[0].clone()));
+        waiters.wake_all();
+        waiters.wake_all();
+        assert_eq!(tasks[0].0.load(Ordering::Relaxed), 2);
+        assert_eq!(tasks[1].0.load(Ordering::Relaxed), 1);
     }
 }

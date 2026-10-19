@@ -1288,10 +1288,16 @@ impl noq::UdpSender for Sender {
                 debug!(dst=%network_path, "dropped transmit: {err:#}");
                 Poll::Ready(Ok(()))
             }
+            Poll::Pending if network_path.is_ip() => {
+                // A full IP socket drains on its own within moments, so Noq waits for it
+                // rather than losing the datagram.  The IP transport registered the waker.
+                trace!(dst=%network_path, "transport pending");
+                Poll::Pending
+            }
             Poll::Pending => {
-                // We do not want to block the next send which might be on a
-                // different transport.  Instead we let Noq handle this as a lost
-                // datagram.
+                // Other transports may stay blocked for long, and waiting would block the
+                // next send which might be on a different transport.  Instead we let Noq
+                // handle this as a lost datagram.
                 // TODO: Revisit this: we might want to do something better.
                 trace!(dst=%network_path, "transport pending, dropped transmit");
                 Poll::Ready(Ok(()))
