@@ -540,6 +540,24 @@ impl QuicTransportConfigBuilder {
     /// Note: this method will ignore nonzero values less than the recommended 8 and will log a
     /// warning.
     pub fn max_remote_nat_traversal_addresses(mut self, max_addresses: u8) -> Self {
+        // Fork change: upstream ignores every value below 8, so holepunching cannot be turned
+        // off. We let 0 through. noq then stores `None` and does not offer the NAT traversal
+        // extension, so no address candidates are exchanged and a connection keeps the path it
+        // was dialled on. Nonzero values below 8 are still ignored, as upstream.
+        //
+        // Why: iroh holepunches again every 60 s while no path has an RTT of 10 ms or less (always
+        // the case across a WAN) and moves a connection to any new path that reads 5 ms faster.
+        // noq keeps congestion state per path, so each move restarts slow start from 12,000 B. On
+        // a link shaped to 50 Mbit/s and 100 ms each way, 300 s of traffic saw 39 path switches
+        // costing an estimated 28.7 s of slow start; with 0 here, none. In CI this made about 30%
+        // of averaging rounds slow.
+        //
+        // Risks: nothing moves a connection to a better path any more. One that starts on a relay
+        // server stays there, and one whose path stops working (for example after a network
+        // change on a multi-homed host bound to 0.0.0.0, when replies leave from another source
+        // address) times out and must be redialled. Upstream does not test this setting. Drop
+        // this change once upstream can turn holepunching off or keeps congestion state across a
+        // path switch. Details and data: PLURALIS.md at the repository root.
         if max_addresses != 0 && max_addresses < MAX_MULTIPATH_PATHS as u8 {
             warn!(
                 "QuicTransportConfig::max_remote_nat_traversal_addresses must be at least {}, ignoring user supplied value",

@@ -277,6 +277,15 @@ impl IpTransport {
 /// one would be woken. Senders poll it with a waker for this set instead, which wakes them all.
 /// A sender that gets a datagram through wakes them too: while the socket is being rebound, netwatch
 /// can drop the registered waker without waking it.
+///
+/// Fork change: upstream has no such set, because it drops the datagram when the socket is full
+/// (see `Sender::poll_send` in `transports.rs`). Cost: one mutex lock per completed send, and one
+/// more per send that finds the socket full. Each completed send wakes every waiting task once
+/// (duplicates are skipped); those that still find the socket full register again, so with many
+/// connections on one full socket a send can cause that many retries. Not profiled on its own: on
+/// loopback with one runtime thread, the whole change left relay CPU per GiB about where upstream
+/// was (2.3 to 2.5 s against 2.2 with 1 busy connection, 2.7 to 2.8 s against 2.7 with 4). More
+/// connections or threads sharing one socket were not measured.
 #[derive(Debug, Default)]
 struct SendWaiters(Mutex<Vec<Waker>>);
 
@@ -373,6 +382,8 @@ impl IpSender {
             segment_size: transmit.segment_size,
             src_ip: src,
         };
+        // Fork change: upstream polls the socket with `cx`. We poll with the shared waker so that
+        // every waiting sender is woken (see `SendWaiters`).
         let this = &mut *self;
         let mut socket_cx = Context::from_waker(&this.socket_waker);
         let mut res = Pin::new(&mut this.sender).poll_send(&transmit, &mut socket_cx);
@@ -606,6 +617,7 @@ mod tests {
         }
     }
 
+    // Fork change: checks the `SendWaiters` fan-out, deduplication and drain.
     #[test]
     fn send_waiters_wake_every_waiting_sender_once() {
         let waiters = Arc::new(SendWaiters::default());

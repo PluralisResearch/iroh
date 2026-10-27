@@ -1289,8 +1289,22 @@ impl noq::UdpSender for Sender {
                 Poll::Ready(Ok(()))
             }
             Poll::Pending if network_path.is_ip() => {
-                // A full IP socket drains on its own within moments, so Noq waits for it
-                // rather than losing the datagram.  The IP transport registered the waker.
+                // Fork change: upstream drops the datagram on Pending for every transport, so
+                // Noq counts it as lost and cuts its congestion window although the network lost
+                // nothing. For IP paths we return Pending instead: a full IP socket drains on its
+                // own within moments, and Noq keeps the transmit and retries it when the IP
+                // transport wakes this task (see `SendWaiters` in `transports/ip.rs`).
+                //
+                // Why: on a busy two-way connection over loopback, upstream dropped 0.5 to 1% of
+                // packets and ran at an unsteady 1.4 to 2.7 Gbit/s each way; waiting gave a steady
+                // 2.1 to 2.2 with no loss and about the same CPU per byte.
+                //
+                // Trade-offs: while this waits, the same connection's sends on its other paths
+                // wait too. The dropped packets were also a loss signal when the host's own uplink
+                // is the bottleneck. On a slow, busy uplink, how much queues there is then set by
+                // the flow-control windows (in one test on such a link, dropping instead did not
+                // shorten the queue; a smaller window did). Drop this change once upstream waits
+                // here and wakes every waiting sender. Details and data: PLURALIS.md.
                 trace!(dst=%network_path, "transport pending");
                 Poll::Pending
             }

@@ -26,6 +26,9 @@ less net work for networks
 </div>
 <br/>
 
+> This is Pluralis's fork of iroh 1.3.0. Its changes against upstream are listed in
+> [PLURALIS.md](PLURALIS.md).
+
 ## What is iroh?
 
 Iroh gives you an API for dialing by public key.

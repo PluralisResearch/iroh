@@ -2489,6 +2489,7 @@ mod tests {
         Ok(())
     }
 
+    // Fork change: checks that `max_remote_nat_traversal_addresses(0)` turns holepunching off.
     #[cfg(feature = "metrics")]
     #[tokio::test]
     #[traced_test]
